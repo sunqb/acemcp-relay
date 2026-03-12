@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"strconv"
@@ -45,9 +46,10 @@ var (
 
 const (
 	// Context keys
-	ContextKeyUserID    = "user_id"
-	ContextKeyStartTime = "start_time"
-	ContextKeyLogID     = "log_id"
+	ContextKeyUserID      = "user_id"
+	ContextKeyStartTime   = "start_time"
+	ContextKeyLogID       = "log_id"
+	ContextKeyInsertDone  = "insert_done"
 
 	// 请求状态
 	StatusPending   = "pending"
@@ -302,6 +304,13 @@ func initDB() error {
 	if err != nil {
 		return err
 	}
+
+	// 配置连接池：避免频繁建连导致 SCRAM-SHA-256 认证消耗大量 CPU
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
 	if err = db.Ping(); err != nil {
 		return err
 	}
@@ -455,17 +464,26 @@ func authMiddleware() gin.HandlerFunc {
 		// 将 user_id 存入 context
 		c.Set(ContextKeyUserID, userID)
 
-		// 生成 UUID 并插入一条 pending 状态的日志记录
+		// 生成 UUID 并异步插入 pending 日志，用 channel 保证后续 UPDATE/FK 的时序
 		logID := uuid.New().String()
-		_, err := db.Exec(`
-			INSERT INTO request_logs (id, user_id, status, request_path, request_method, request_timestamp, client_ip)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`, logID, userID, StatusPending, c.Request.URL.Path, c.Request.Method, startTime, c.ClientIP())
-		if err != nil {
-			log.Printf("[ERROR] Failed to insert request log: %v", err)
-		} else {
-			c.Set(ContextKeyLogID, logID)
-		}
+		c.Set(ContextKeyLogID, logID)
+
+		insertDone := make(chan struct{})
+		c.Set(ContextKeyInsertDone, insertDone)
+
+		path := c.Request.URL.Path
+		method := c.Request.Method
+		clientIP := c.ClientIP()
+		go func() {
+			defer close(insertDone)
+			_, err := db.Exec(`
+				INSERT INTO request_logs (id, user_id, status, request_path, request_method, request_timestamp, client_ip)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)
+			`, logID, userID, StatusPending, path, method, startTime, clientIP)
+			if err != nil {
+				log.Printf("[ERROR] Failed to insert request log: %v", err)
+			}
+		}()
 
 		c.Next()
 	}
@@ -476,6 +494,7 @@ type RequestLogEntry struct {
 	LogID            string
 	StatusCode       int
 	ResponseDuration time.Duration
+	InsertDone       <-chan struct{}
 }
 
 // completeRequestLogAsync 异步更新请求日志状态为已完成
@@ -484,9 +503,12 @@ func completeRequestLogAsync(entry RequestLogEntry) {
 		if entry.LogID == "" {
 			return
 		}
+		if entry.InsertDone != nil {
+			<-entry.InsertDone
+		}
 		durationMs := entry.ResponseDuration.Milliseconds()
 
-		_, err := db.Exec(`
+		result, err := db.Exec(`
 			UPDATE request_logs
 			SET status = $1, status_code = $2, response_duration_ms = $3, updated_at = NOW()
 			WHERE id = $4
@@ -494,17 +516,22 @@ func completeRequestLogAsync(entry RequestLogEntry) {
 
 		if err != nil {
 			log.Printf("[ERROR] Failed to update request log: %v", err)
+		} else if rows, _ := result.RowsAffected(); rows == 0 {
+			log.Printf("[WARN] Update request log affected 0 rows (id=%s)", entry.LogID)
 		}
 	}()
 }
 
 // saveErrorDetailsAsync 异步保存错误详情到数据库
 // source: "proxy" 表示本地转发服务错误，"upstream" 表示上游服务错误
-func saveErrorDetailsAsync(logID string, source string, errorMsg string) {
+func saveErrorDetailsAsync(logID string, source string, errorMsg string, insertDone <-chan struct{}) {
 	if logID == "" || errorMsg == "" {
 		return
 	}
 	go func() {
+		if insertDone != nil {
+			<-insertDone
+		}
 		_, err := db.Exec(`
 			INSERT INTO error_details (request_id, source, error)
 			VALUES ($1, $2, $3)
@@ -513,6 +540,16 @@ func saveErrorDetailsAsync(logID string, source string, errorMsg string) {
 			log.Printf("[ERROR] Failed to save error details: %v", err)
 		}
 	}()
+}
+
+// getInsertDone 从 Gin context 提取 INSERT 完成信号
+func getInsertDone(c *gin.Context) <-chan struct{} {
+	if v, ok := c.Get(ContextKeyInsertDone); ok {
+		if ch, ok := v.(chan struct{}); ok {
+			return ch
+		}
+	}
+	return nil
 }
 
 // getRequestLogEntry 从 Gin context 提取日志数据
@@ -531,6 +568,7 @@ func getRequestLogEntry(c *gin.Context, statusCode int) RequestLogEntry {
 		LogID:            logIDVal,
 		StatusCode:       statusCode,
 		ResponseDuration: time.Since(startTimeVal),
+		InsertDone:       getInsertDone(c),
 	}
 }
 
@@ -607,7 +645,7 @@ func proxyHandler(c *gin.Context) {
 		}
 		logID, _ := c.Get(ContextKeyLogID)
 		logIDStr, _ := logID.(string)
-		saveErrorDetailsAsync(logIDStr, "proxy", err.Error())
+		saveErrorDetailsAsync(logIDStr, "proxy", err.Error(), getInsertDone(c))
 		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{"error": "failed to forward request"})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadGateway))
 		return
@@ -633,7 +671,7 @@ func proxyHandler(c *gin.Context) {
 	if resp.StatusCode >= 400 {
 		logID, _ := c.Get(ContextKeyLogID)
 		logIDStr, _ := logID.(string)
-		saveErrorDetailsAsync(logIDStr, "upstream", string(respBody))
+		saveErrorDetailsAsync(logIDStr, "upstream", string(respBody), getInsertDone(c))
 	}
 
 	// 对 /get-models 成功响应进行隐私处理
@@ -658,7 +696,7 @@ func sseProxyHandler(c *gin.Context) {
 		if err = validateChatStreamRequest(body); err != nil {
 			logID, _ := c.Get(ContextKeyLogID)
 			logIDStr, _ := logID.(string)
-			saveErrorDetailsAsync(logIDStr, "proxy", err.Error())
+			saveErrorDetailsAsync(logIDStr, "proxy", err.Error(), getInsertDone(c))
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "request validation failed"})
 			completeRequestLogAsync(getRequestLogEntry(c, http.StatusForbidden))
 			return
@@ -699,7 +737,7 @@ func sseProxyHandler(c *gin.Context) {
 		}
 		logID, _ := c.Get(ContextKeyLogID)
 		logIDStr, _ := logID.(string)
-		saveErrorDetailsAsync(logIDStr, "proxy", err.Error())
+		saveErrorDetailsAsync(logIDStr, "proxy", err.Error(), getInsertDone(c))
 		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{"error": "failed to forward request: " + err.Error()})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusBadGateway))
 		return
@@ -711,7 +749,7 @@ func sseProxyHandler(c *gin.Context) {
 		respBody, _ := io.ReadAll(resp.Body)
 		logID, _ := c.Get(ContextKeyLogID)
 		logIDStr, _ := logID.(string)
-		saveErrorDetailsAsync(logIDStr, "upstream", string(respBody))
+		saveErrorDetailsAsync(logIDStr, "upstream", string(respBody), getInsertDone(c))
 		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 		completeRequestLogAsync(getRequestLogEntry(c, resp.StatusCode))
 		return
@@ -1058,6 +1096,20 @@ func main() {
 	// 启动 health check 定时任务
 	log.Println("[HEALTH] Starting health scheduler...")
 	go startHealthScheduler(ctx)
+
+	// 启动 pprof server（独立 mux，仅本地访问）
+	go func() {
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		log.Println("[PPROF] Listening on 127.0.0.1:6060")
+		if err := http.ListenAndServe("127.0.0.1:6060", pprofMux); err != nil {
+			log.Printf("[PPROF] Server error: %v", err)
+		}
+	}()
 
 	r := gin.Default()
 
