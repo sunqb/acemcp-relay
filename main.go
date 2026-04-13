@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
@@ -22,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -114,6 +117,9 @@ var skipRequestHeaders = map[string]bool{
 	"Sentry-Trace":         true,
 	"Baggage":              true,
 	"User-Agent":           true,
+	// 由 relay 控制压缩策略，忽略客户端传入的编码头
+	"Accept-Encoding":  true,
+	"Content-Encoding": true,
 }
 
 // 响应头过滤：hop-by-hop 头，代理不应转发
@@ -596,6 +602,151 @@ func validateChatStreamRequest(body []byte) error {
 	return nil
 }
 
+// ── 压缩相关 ──────────────────────────────────────────────────────────────
+
+// compressMinBytes 低于此大小的 body 不压缩，避免小数据压缩后膨胀
+const compressMinBytes = 128
+
+// encodingPriority 定义支持的编码及其优先级，数值越大越优先
+var encodingPriority = map[string]int{
+	"br":       4,
+	"gzip":     3,
+	"deflate":  2,
+	"identity": 1,
+}
+
+// compressBodyBrotli 使用 brotli 压缩数据，失败时返回原始数据和 error
+func compressBodyBrotli(data []byte) ([]byte, error) {
+	if len(data) < compressMinBytes {
+		return data, nil
+	}
+	var buf bytes.Buffer
+	w := brotli.NewWriterLevel(&buf, brotli.DefaultCompression)
+	if _, err := w.Write(data); err != nil {
+		return data, fmt.Errorf("brotli write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return data, fmt.Errorf("brotli close: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// negotiateEncoding 解析 Accept-Encoding 头，返回最佳匹配编码
+// 优先级：br > gzip > deflate > identity
+func negotiateEncoding(acceptEncoding string) string {
+	if acceptEncoding == "" {
+		return "identity"
+	}
+
+	type candidate struct {
+		encoding string
+		quality  float64
+		priority int
+	}
+
+	// 记录显式列出的编码名，用于通配符展开
+	explicit := make(map[string]bool)
+	var wildcardQuality float64 = -1
+
+	var candidates []candidate
+	for _, part := range strings.Split(acceptEncoding, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		encoding := part
+		quality := 1.0
+
+		if idx := strings.Index(part, ";"); idx != -1 {
+			encoding = strings.TrimSpace(part[:idx])
+			qPart := strings.TrimSpace(part[idx+1:])
+			if strings.HasPrefix(qPart, "q=") {
+				if q, err := strconv.ParseFloat(qPart[2:], 64); err == nil {
+					quality = q
+				}
+			}
+		}
+
+		encoding = strings.ToLower(encoding)
+
+		if encoding == "*" {
+			wildcardQuality = quality
+			continue
+		}
+
+		explicit[encoding] = true
+
+		if quality == 0 {
+			continue
+		}
+
+		if prio, ok := encodingPriority[encoding]; ok {
+			candidates = append(candidates, candidate{encoding, quality, prio})
+		}
+	}
+
+	// 通配符展开：将未显式列出的支持编码以通配符 quality 加入候选
+	if wildcardQuality > 0 {
+		for enc, prio := range encodingPriority {
+			if !explicit[enc] {
+				candidates = append(candidates, candidate{enc, wildcardQuality, prio})
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "identity"
+	}
+
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.quality > best.quality || (c.quality == best.quality && c.priority > best.priority) {
+			best = c
+		}
+	}
+	return best.encoding
+}
+
+// compressResponse 按指定编码压缩数据，失败时回退为 identity
+func compressResponse(data []byte, encoding string) ([]byte, string) {
+	if len(data) < compressMinBytes || encoding == "identity" {
+		return data, "identity"
+	}
+
+	var buf bytes.Buffer
+	var err error
+
+	switch encoding {
+	case "br":
+		w := brotli.NewWriterLevel(&buf, brotli.DefaultCompression)
+		_, err = w.Write(data)
+		if closeErr := w.Close(); err == nil {
+			err = closeErr
+		}
+	case "gzip":
+		w := gzip.NewWriter(&buf)
+		_, err = w.Write(data)
+		if closeErr := w.Close(); err == nil {
+			err = closeErr
+		}
+	case "deflate":
+		w, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+		_, err = w.Write(data)
+		if closeErr := w.Close(); err == nil {
+			err = closeErr
+		}
+	default:
+		return data, "identity"
+	}
+
+	if err != nil {
+		log.Printf("[COMPRESS] %s compression failed: %v, falling back to identity", encoding, err)
+		return data, "identity"
+	}
+	return buf.Bytes(), encoding
+}
+
 func proxyHandler(c *gin.Context) {
 	// 拦截 /record-request-events 和 /report-error，不转发到上游，避免被 trace
 	if c.Request.URL.Path == "/record-request-events" || c.Request.URL.Path == "/report-error" {
@@ -611,9 +762,22 @@ func proxyHandler(c *gin.Context) {
 		return
 	}
 
+	// 请求体 brotli 压缩（小于阈值不压缩）
+	compressedBody, compErr := compressBodyBrotli(body)
+	useCompressedReq := compErr == nil && len(body) >= compressMinBytes
+	if compErr != nil {
+		log.Printf("[COMPRESS] Request brotli compression failed: %v, sending uncompressed", compErr)
+	}
+
 	targetURL := augmentAPIURL + c.Request.URL.Path
 
-	req, err := http.NewRequestWithContext(c.Request.Context(), "POST", targetURL, bytes.NewReader(body))
+	var reqBody []byte
+	if useCompressedReq {
+		reqBody = compressedBody
+	} else {
+		reqBody = body
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), "POST", targetURL, bytes.NewReader(reqBody))
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to create request"})
 		completeRequestLogAsync(getRequestLogEntry(c, http.StatusInternalServerError))
@@ -629,6 +793,10 @@ func proxyHandler(c *gin.Context) {
 		for _, v := range values {
 			req.Header.Add(key, v)
 		}
+	}
+
+	if useCompressedReq {
+		req.Header.Set("Content-Encoding", "br")
 	}
 
 	// 注入模拟 CLI/插件 请求头
@@ -677,6 +845,14 @@ func proxyHandler(c *gin.Context) {
 	// 对 /get-models 成功响应进行隐私处理
 	if c.Request.URL.Path == "/get-models" && resp.StatusCode == http.StatusOK {
 		respBody = sanitizeGetModelsResponse(respBody)
+	}
+
+	// 根据客户端 Accept-Encoding 压缩响应体
+	chosenEncoding := negotiateEncoding(c.GetHeader("Accept-Encoding"))
+	respBody, actualEncoding := compressResponse(respBody, chosenEncoding)
+	if actualEncoding != "identity" {
+		c.Header("Content-Encoding", actualEncoding)
+		c.Header("Vary", "Accept-Encoding")
 	}
 
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
@@ -1119,10 +1295,10 @@ func main() {
 		r.POST(path, proxyHandler)
 	}
 
-	// 注册 SSE 流式路由
-	for _, path := range ssePaths {
-		r.POST(path, sseProxyHandler)
-	}
+	// 注册 SSE 流式路由（暂时禁用，保留代码）
+	// for _, path := range ssePaths {
+	// 	r.POST(path, sseProxyHandler)
+	// }
 
 	// 处理 404 路由不匹配
 	// 注意：authMiddleware 已经为认证成功的请求创建了 pending 日志，这里只需更新状态
