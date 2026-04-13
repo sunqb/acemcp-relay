@@ -78,6 +78,10 @@ var allowedPaths = []string{
 	"/agents/codebase-retrieval",
 	"/record-request-events",
 	"/report-error",
+	"/settings/get-mcp-user-configs",
+	"/settings/get-mcp-tenant-configs",
+	"/indexed-commits/register-blobset",
+	"/indexed-commits/get-latest-blobset",
 }
 
 var ssePaths = []string{
