@@ -145,4 +145,53 @@ go build -o acemcp-relay .
 
 ## 日志
 
-服务日志同时输出到控制台和 `gin.log` 文件。
+服务日志输出到 stdout/stderr，由 Docker logging driver（默认 json-file）或系统 journal 收集。
+
+## Docker 部署
+
+### 前置要求
+
+- Docker 20.10+
+- Docker Compose v2
+
+### 快速部署
+
+1. 复制并编辑环境变量文件：
+
+```bash
+cp .env.example .env
+# 编辑 .env，填写 AUGMENT_API_URL、AUGMENT_API_TOKEN、DB_PASSWORD 等必填项
+```
+
+2. 启动全部服务：
+
+```bash
+docker compose up -d
+```
+
+3. 查看服务状态：
+
+```bash
+docker compose ps
+docker compose logs relay
+```
+
+4. 停止服务：
+
+```bash
+docker compose down
+```
+
+### 数据持久化
+
+PostgreSQL 数据存储在 Docker named volume `postgres_data` 中，`docker compose down` 不会删除数据。如需清除数据：
+
+```bash
+docker compose down -v
+```
+
+### 镜像说明
+
+- 使用多阶段构建，最终镜像基于 `gcr.io/distroless/static-debian12`
+- 镜像体积约 15-20MB，以非 root 用户运行
+- 日志输出到 stdout，由 Docker logging driver 收集
