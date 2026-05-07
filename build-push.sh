@@ -2,7 +2,7 @@
 set -e
 
 IMAGE="sunqb/acemcp-relay"
-TAG="${1:-latest}"
+TAG="${1:-latest}-amd64"
 
 echo ">>> 构建镜像并推送 ${IMAGE}:${TAG}"
 docker build \
