@@ -1,0 +1,10 @@
+.git
+.env
+*.log
+gin.log
+docs/
+README.md
+docker-compose.yml
+.dockerignore
+acemcp-relay
+acemcp-relay.exe
