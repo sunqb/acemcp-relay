@@ -19,15 +19,16 @@ RUN CGO_ENABLED=0 \
     go build -ldflags="-w -s" -o acemcp-relay .
 
 # ── Stage 2: Run ─────────────────────────────────────────────────────────────
-FROM docker.m.daocloud.io/distroless/static-debian12:nonroot
+FROM docker.m.daocloud.io/library/alpine:3.20
+
+# 以非 root 用户运行
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 
-# 从 builder 复制二进制
 COPY --from=builder /build/acemcp-relay .
 
-# 使用非 root 用户（distroless nonroot 镜像默认 uid=65532）
-USER nonroot:nonroot
+USER appuser:appgroup
 
 EXPOSE 3009
 
