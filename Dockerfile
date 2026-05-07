@@ -1,5 +1,5 @@
 # ── Stage 1: Build ──────────────────────────────────────────────────────────
-FROM golang:1.25-alpine AS builder
+FROM docker.m.daocloud.io/library/golang:1.25-alpine AS builder
 
 # 安装构建依赖
 RUN apk add --no-cache git
@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 \
     go build -ldflags="-w -s" -o acemcp-relay .
 
 # ── Stage 2: Run ─────────────────────────────────────────────────────────────
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM docker.m.daocloud.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
