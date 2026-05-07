@@ -6,6 +6,9 @@ RUN apk add --no-cache git
 
 WORKDIR /build
 
+# 设置 Go 代理（国内加速）
+ENV GOPROXY=https://goproxy.cn,direct
+
 # 先复制依赖文件，利用 Docker layer 缓存
 COPY go.mod go.sum ./
 RUN go mod download
