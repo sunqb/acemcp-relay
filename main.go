@@ -1241,14 +1241,10 @@ func main() {
 	// 加载配置
 	loadConfig()
 
-	// 设置日志同时输出到控制台和文件
-	logFile, err := os.OpenFile("gin.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		panic("无法创建日志文件: " + err.Error())
-	}
-	gin.DefaultWriter = io.MultiWriter(os.Stdout, logFile)
-	gin.DefaultErrorWriter = io.MultiWriter(os.Stderr, logFile)
-	log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+	// 日志只输出到 stdout/stderr（容器环境，由 Docker logging driver 收集）
+	gin.DefaultWriter = os.Stdout
+	gin.DefaultErrorWriter = os.Stderr
+	log.SetOutput(os.Stdout)
 
 	// 初始化数据库连接
 	if err := initDB(); err != nil {
