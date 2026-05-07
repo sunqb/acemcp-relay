@@ -15,7 +15,7 @@ RUN go mod download
 
 # 复制源码并编译
 COPY *.go ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 \
     go build -ldflags="-w -s" -o acemcp-relay .
 
 # ── Stage 2: Run ─────────────────────────────────────────────────────────────
