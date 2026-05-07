@@ -1,5 +1,5 @@
 # ── Stage 1: Build ──────────────────────────────────────────────────────────
-FROM mirrors.tencent.com/library/golang:1.25-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 # 安装构建依赖
 RUN apk add --no-cache git
@@ -19,16 +19,13 @@ RUN CGO_ENABLED=0 \
     go build -ldflags="-w -s" -o acemcp-relay .
 
 # ── Stage 2: Run ─────────────────────────────────────────────────────────────
-FROM mirrors.tencent.com/library/alpine:3.20
-
-# 以非 root 用户运行
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
 COPY --from=builder /build/acemcp-relay .
 
-USER appuser:appgroup
+USER nonroot:nonroot
 
 EXPOSE 3009
 
