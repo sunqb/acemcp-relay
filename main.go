@@ -42,6 +42,8 @@ var (
 	dbUser          string
 	dbPassword      string
 	dbName          string
+	defaultAPIKey   string
+	defaultAPIUser  string
 	redisHost       string
 	redisPort       int
 	apiKeyCacheTTL  time.Duration
@@ -50,10 +52,10 @@ var (
 
 const (
 	// Context keys
-	ContextKeyUserID      = "user_id"
-	ContextKeyStartTime   = "start_time"
-	ContextKeyLogID       = "log_id"
-	ContextKeyInsertDone  = "insert_done"
+	ContextKeyUserID     = "user_id"
+	ContextKeyStartTime  = "start_time"
+	ContextKeyLogID      = "log_id"
+	ContextKeyInsertDone = "insert_done"
 
 	// 请求状态
 	StatusPending   = "pending"
@@ -275,6 +277,8 @@ func loadConfig() {
 	dbUser = getEnv("DB_USER", "postgres")
 	dbPassword = getEnv("DB_PASSWORD", "")
 	dbName = getEnv("DB_NAME", "postgres")
+	defaultAPIKey = getEnv("DEFAULT_API_KEY", "")
+	defaultAPIUser = getEnv("DEFAULT_API_USER_ID", "default")
 	redisHost = getEnv("REDIS_HOST", "localhost")
 	redisPort = getEnvInt("REDIS_PORT", 6379)
 	apiKeyCacheTTL = getEnvDuration("API_KEY_CACHE_TTL", 30*time.Minute)
@@ -325,6 +329,36 @@ func initDB() error {
 
 	if err = db.Ping(); err != nil {
 		return err
+	}
+
+	// 自动迁移：创建 api_keys 表，并按需写入 .env 中配置的默认客户端 key
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS api_keys (
+			id VARCHAR(32) PRIMARY KEY,
+			user_id VARCHAR(255) NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to migrate api_keys table: %w", err)
+	}
+
+	if defaultAPIKey != "" {
+		hash := md5.Sum([]byte(defaultAPIKey))
+		tokenMD5 := hex.EncodeToString(hash[:])
+		_, err = db.Exec(`
+			INSERT INTO api_keys (id, user_id, updated_at)
+			VALUES ($1, $2, NOW())
+			ON CONFLICT (id) DO UPDATE SET
+				user_id = EXCLUDED.user_id,
+				updated_at = NOW()
+		`, tokenMD5, defaultAPIUser)
+		if err != nil {
+			return fmt.Errorf("failed to upsert default api key: %w", err)
+		}
+		log.Printf("[AUTH] Default API key configured for user_id=%s", defaultAPIUser)
 	}
 
 	// 自动迁移：创建 request_logs 表
@@ -1194,12 +1228,12 @@ func runHealthProbe() {
 
 	// Step 3: codebase-retrieval
 	retBody, _ := json.Marshal(map[string]interface{}{
-		"information_request":          "Find the main function or main entry point",
-		"blobs":                        map[string]interface{}{"checkpoint_id": nil, "added_blobs": []string{healthTestBlobName}, "deleted_blobs": []string{}},
-		"dialog":                       []interface{}{},
-		"max_output_length":            0,
-		"disable_codebase_retrieval":   false,
-		"enable_commit_retrieval":      false,
+		"information_request":           "Find the main function or main entry point",
+		"blobs":                         map[string]interface{}{"checkpoint_id": nil, "added_blobs": []string{healthTestBlobName}, "deleted_blobs": []string{}},
+		"dialog":                        []interface{}{},
+		"max_output_length":             0,
+		"disable_codebase_retrieval":    false,
+		"enable_commit_retrieval":       false,
 		"enable_conversation_retrieval": false,
 	})
 

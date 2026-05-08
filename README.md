@@ -119,6 +119,19 @@ go build -o acemcp-relay .
 | `DB_PASSWORD` | 数据库密码 | （空） |
 | `DB_NAME` | 数据库名称 | `postgres` |
 
+### 客户端 API Key 配置
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `DEFAULT_API_KEY` | 默认客户端 Bearer Token；非空时服务启动会自动写入 `api_keys` 表 | （空） |
+| `DEFAULT_API_USER_ID` | 默认客户端 key 对应的用户 ID，用于请求日志和排行榜统计 | `default` |
+
+客户端请求时使用原始 `DEFAULT_API_KEY`：
+
+```bash
+Authorization: Bearer <DEFAULT_API_KEY>
+```
+
 ### Redis 配置
 
 | 变量 | 说明 | 默认值 |
@@ -133,6 +146,7 @@ go build -o acemcp-relay .
 服务启动时会自动迁移创建以下表：
 
 - **`request_logs`**：请求日志，记录每个请求的用户、路径、状态码、耗时等；日志 INSERT 为异步写入（channel 协调，确保后续 UPDATE / 外键操作等待 INSERT 完成），并在 `(user_id, request_timestamp)` 上建有复合索引
+- **`api_keys`**：客户端 API Key 表，主键为客户端 Bearer Token 的 MD5 值，服务启动时会按 `DEFAULT_API_KEY` 自动创建或更新默认记录
 - **`error_details`**：错误详情，关联到 request_logs，区分代理层（proxy）和上游（upstream）错误
 - **`leaderboard`**：每日用户请求量排行榜
 - **`health_checks`**：上游健康检查历史，记录状态、TCP ping 耗时、codebase-retrieval 耗时、错误信息及下次检查时间
