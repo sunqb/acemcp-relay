@@ -1,5 +1,8 @@
 # ── Stage 1: Build ──────────────────────────────────────────────────────────
-FROM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 # 安装构建依赖
 RUN apk add --no-cache git
@@ -15,7 +18,7 @@ RUN go mod download
 
 # 复制源码并编译
 COPY *.go ./
-RUN CGO_ENABLED=0 GOARCH=amd64 GOOS=linux \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -ldflags="-w -s" -o acemcp-relay .
 
 # ── Stage 2: Run ─────────────────────────────────────────────────────────────
